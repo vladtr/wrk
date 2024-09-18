@@ -1,8 +1,11 @@
 // Copyright (C) 2012 - Will Glozer.  All rights reserved.
 
+#include <pthread.h>
 #include "wrk.h"
 #include "script.h"
 #include "main.h"
+
+static pthread_mutex_t jsonl_mutex = PTHREAD_MUTEX_INITIALIZER;
 
 static struct config {
     uint64_t connections;
@@ -16,6 +19,8 @@ static struct config {
     char    *host;
     char    *script;
     SSL_CTX *ctx;
+    char    *input_file_path;  // Path to the input JSONL file
+    FILE    *input_file;       // File pointer for the input file
 } cfg;
 
 static struct {
@@ -41,6 +46,24 @@ static void handler(int sig) {
     stop = 1;
 }
 
+
+static char* get_next_jsonl_line(FILE *file) {
+    pthread_mutex_lock(&jsonl_mutex);
+
+    char *line = NULL;
+    size_t len = 0;
+    ssize_t read = getline(&line, &len, file);  // Read the next line from the input file
+
+    pthread_mutex_unlock(&jsonl_mutex);
+
+    if (read == -1) {
+        free(line);
+        return NULL;  // Return NULL if EOF is reached
+    }
+
+    return line;  // Return the line to be used as the request payload
+}
+
 static void usage() {
     printf("Usage: wrk <options> <url>                            \n"
            "  Options:                                            \n"
@@ -59,19 +82,23 @@ static void usage() {
 }
 
 int main(int argc, char **argv) {
+
     char *url, **headers = zmalloc(argc * sizeof(char *));
     struct http_parser_url parts = {};
 
+    // Parse command line arguments
     if (parse_args(&cfg, &url, &parts, headers, argc, argv)) {
         usage();
         exit(1);
     }
 
+    // Parse URL components
     char *schema  = copy_url_part(url, &parts, UF_SCHEMA);
     char *host    = copy_url_part(url, &parts, UF_HOST);
     char *port    = copy_url_part(url, &parts, UF_PORT);
     char *service = port ? port : schema;
 
+    // Check for HTTPS connection and initialize SSL if necessary
     if (!strncmp("https", schema, 5)) {
         if ((cfg.ctx = ssl_init()) == NULL) {
             fprintf(stderr, "unable to initialize SSL\n");
@@ -85,41 +112,61 @@ int main(int argc, char **argv) {
         sock.readable = ssl_readable;
     }
 
+    // Declare the Lua state pointer but don't initialize it yet
+    lua_State *L = NULL;
+
+    // Open the input JSONL file if specified with the -i flag
+    if (cfg.input_file_path) {
+        cfg.input_file = fopen(cfg.input_file_path, "r");
+        if (!cfg.input_file) {
+            fprintf(stderr, "Could not open input file: %s\n", strerror(errno));
+            exit(1);
+        }
+    } else {
+        // Initialize Lua script only if no input file is provided
+        L = script_create(cfg.script, url, headers);
+        if (!script_resolve(L, host, service)) {
+            char *msg = strerror(errno);
+            fprintf(stderr, "unable to connect to %s:%s %s\n", host, service, msg);
+            exit(1);
+        }
+        // Setup Lua requests and responses
+        // No need for `script_setup_for_requests_and_responses` – the Lua system handles this in `script_create`.
+    }
+
+    // Set up the signal handlers
     signal(SIGPIPE, SIG_IGN);
     signal(SIGINT,  SIG_IGN);
 
+    // Initialize statistics
     statistics.latency  = stats_alloc(cfg.timeout * 1000);
     statistics.requests = stats_alloc(MAX_THREAD_RATE_S);
     thread *threads     = zcalloc(cfg.threads * sizeof(thread));
 
-    lua_State *L = script_create(cfg.script, url, headers);
-    if (!script_resolve(L, host, service)) {
-        char *msg = strerror(errno);
-        fprintf(stderr, "unable to connect to %s:%s %s\n", host, service, msg);
-        exit(1);
-    }
-
-    cfg.host = host;
-
+    // Start each worker thread
     for (uint64_t i = 0; i < cfg.threads; i++) {
         thread *t      = &threads[i];
         t->loop        = aeCreateEventLoop(10 + cfg.connections * 3);
         t->connections = cfg.connections / cfg.threads;
 
-        t->L = script_create(cfg.script, url, headers);
-        script_init(L, t, argc - optind, &argv[optind]);
+        if (!cfg.input_file_path) {
+            // If no input file, initialize Lua for each thread
+            t->L = script_create(cfg.script, url, headers);
+            script_init(t->L, t, argc - optind, &argv[optind]);
 
-        if (i == 0) {
-            cfg.pipeline = script_verify_request(t->L);
-            cfg.dynamic  = !script_is_static(t->L);
-            cfg.delay    = script_has_delay(t->L);
-            if (script_want_response(t->L)) {
-                parser_settings.on_header_field = header_field;
-                parser_settings.on_header_value = header_value;
-                parser_settings.on_body         = response_body;
+            if (i == 0) {
+                cfg.pipeline = script_verify_request(t->L);
+                cfg.dynamic  = !script_is_static(t->L);
+                cfg.delay    = script_has_delay(t->L);
+                if (script_want_response(t->L)) {
+                    parser_settings.on_header_field = header_field;
+                    parser_settings.on_header_value = header_value;
+                    parser_settings.on_body         = response_body;
+                }
             }
         }
 
+        // Create threads and handle errors
         if (!t->loop || pthread_create(&t->thread, NULL, &thread_main, t)) {
             char *msg = strerror(errno);
             fprintf(stderr, "unable to create thread %"PRIu64": %s\n", i, msg);
@@ -127,6 +174,7 @@ int main(int argc, char **argv) {
         }
     }
 
+    // Setup signal handlers to stop the program
     struct sigaction sa = {
         .sa_handler = handler,
         .sa_flags   = 0,
@@ -134,6 +182,7 @@ int main(int argc, char **argv) {
     sigfillset(&sa.sa_mask);
     sigaction(SIGINT, &sa, NULL);
 
+    // Run the test and collect statistics
     char *time = format_time_s(cfg.duration);
     printf("Running %s test @ %s\n", time, url);
     printf("  %"PRIu64" threads and %"PRIu64" connections\n", cfg.threads, cfg.connections);
@@ -143,9 +192,11 @@ int main(int argc, char **argv) {
     uint64_t bytes    = 0;
     errors errors     = { 0 };
 
+    // Sleep until the duration is reached
     sleep(cfg.duration);
     stop = 1;
 
+    // Join threads and accumulate statistics
     for (uint64_t i = 0; i < cfg.threads; i++) {
         thread *t = &threads[i];
         pthread_join(t->thread, NULL);
@@ -160,23 +211,24 @@ int main(int argc, char **argv) {
         errors.status  += t->errors.status;
     }
 
+    // Calculate performance metrics
     uint64_t runtime_us = time_us() - start;
     long double runtime_s   = runtime_us / 1000000.0;
-    long double req_per_s   = complete   / runtime_s;
-    long double bytes_per_s = bytes      / runtime_s;
+    long double req_per_s   = complete / runtime_s;
+    long double bytes_per_s = bytes / runtime_s;
 
     if (complete / cfg.connections > 0) {
         int64_t interval = runtime_us / (complete / cfg.connections);
         stats_correct(statistics.latency, interval);
     }
 
+    // Print statistics
     print_stats_header();
     print_stats("Latency", statistics.latency, format_time_us);
     print_stats("Req/Sec", statistics.requests, format_metric);
     if (cfg.latency) print_stats_latency(statistics.latency);
 
     char *runtime_msg = format_time_us(runtime_us);
-
     printf("  %"PRIu64" requests in %s, %sB read\n", complete, runtime_msg, format_binary(bytes));
     if (errors.connect || errors.read || errors.write || errors.timeout) {
         printf("  Socket errors: connect %d, read %d, write %d, timeout %d\n",
@@ -190,10 +242,16 @@ int main(int argc, char **argv) {
     printf("Requests/sec: %9.2Lf\n", req_per_s);
     printf("Transfer/sec: %10sB\n", format_binary(bytes_per_s));
 
-    if (script_has_done(L)) {
+    // Finalize Lua scripting if it was used
+    if (L && script_has_done(L)) {
         script_summary(L, runtime_us, complete, bytes);
         script_errors(L, &errors);
         script_done(L, statistics.latency, statistics.requests);
+    }
+
+    // Close the input JSONL file if used
+    if (cfg.input_file) {
+        fclose(cfg.input_file);
     }
 
     return 0;
@@ -205,30 +263,48 @@ void *thread_main(void *arg) {
     char *request = NULL;
     size_t length = 0;
 
-    if (!cfg.dynamic) {
-        script_request(thread->L, &request, &length);
+    while (!stop) {
+        if (cfg.input_file) {
+            // Read the next line from the input file for each request
+            request = get_next_jsonl_line(cfg.input_file);
+            printf("!poop!\r\n");
+            if (request) {
+                length = strlen(request);
+            } else {
+                break;  // Stop if no more lines
+            }
+        } else if (!cfg.dynamic) {
+            // Fall back to Lua-based requests if no input file is specified
+            script_request(thread->L, &request, &length);
+        }
+
+        thread->cs = zcalloc(thread->connections * sizeof(connection));
+        connection *c = thread->cs;
+
+        for (uint64_t i = 0; i < thread->connections; i++, c++) {
+            c->thread = thread;
+            c->ssl     = cfg.ctx ? SSL_new(cfg.ctx) : NULL;
+            c->request = zstrdup(request);  // Make a copy of the request for each connection
+            c->length  = length;
+            c->delayed = cfg.delay;
+           // connect_socket(thread, c);
+        }
+
+        aeEventLoop *loop = thread->loop;
+        aeCreateTimeEvent(loop, RECORD_INTERVAL_MS, record_rate, thread, NULL);
+
+        thread->start = time_us();
+        aeMain(loop);
+
+        // Free the allocated memory for the request string
+        if (request) {
+            free(request);
+            request = NULL;
+        }
+
+        aeDeleteEventLoop(loop);
+        zfree(thread->cs);
     }
-
-    thread->cs = zcalloc(thread->connections * sizeof(connection));
-    connection *c = thread->cs;
-
-    for (uint64_t i = 0; i < thread->connections; i++, c++) {
-        c->thread = thread;
-        c->ssl     = cfg.ctx ? SSL_new(cfg.ctx) : NULL;
-        c->request = request;
-        c->length  = length;
-        c->delayed = cfg.delay;
-        connect_socket(thread, c);
-    }
-
-    aeEventLoop *loop = thread->loop;
-    aeCreateTimeEvent(loop, RECORD_INTERVAL_MS, record_rate, thread, NULL);
-
-    thread->start = time_us();
-    aeMain(loop);
-
-    aeDeleteEventLoop(loop);
-    zfree(thread->cs);
 
     return NULL;
 }
@@ -256,6 +332,7 @@ static int connect_socket(thread *thread, connection *c) {
         c->fd = fd;
         return fd;
     }
+
 
   error:
     thread->errors.connect++;
@@ -489,10 +566,13 @@ static int parse_args(struct config *cfg, char **url, struct http_parser_url *pa
     cfg->duration    = 10;
     cfg->timeout     = SOCKET_TIMEOUT_MS;
 
-    while ((c = getopt_long(argc, argv, "t:c:d:s:H:T:Lrv?", longopts, NULL)) != -1) {
+    while ((c = getopt_long(argc, argv, "t:c:d:s:H:T:i:Lrv?", longopts, NULL)) != -1) {
         switch (c) {
             case 't':
                 if (scan_metric(optarg, &cfg->threads)) return -1;
+                break;
+            case 'i':
+                cfg->input_file_path = optarg;  // Store the path to the input JSONL file
                 break;
             case 'c':
                 if (scan_metric(optarg, &cfg->connections)) return -1;
